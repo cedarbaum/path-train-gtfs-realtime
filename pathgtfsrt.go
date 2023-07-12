@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/benbjohnson/clock"
 	gtfs "github.com/jamespfennell/path-train-gtfs-realtime/proto/gtfsrt"
+	portauthority "github.com/jamespfennell/path-train-gtfs-realtime/proto/portauthority"
 	sourceapi "github.com/jamespfennell/path-train-gtfs-realtime/proto/sourceapi"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -29,6 +32,12 @@ type SourceClient interface {
 	GetRouteToRouteId(context.Context) (map[sourceapi.Route]string, error)
 	// List all upcoming trains at a station
 	GetTrainsAtStation(context.Context, sourceapi.Station) ([]Train, error)
+}
+
+type Incident *portauthority.GetIncidentsResponse_Data
+
+type PortAuthorityClient interface {
+	GetIncidents(context.Context) ([]Incident, error)
 }
 
 // Feed periodically generates GTFS Realtime data for the PATH train and makes
@@ -48,24 +57,11 @@ type Feed struct {
 // from the source API.
 type UpdateCallback func(msg *gtfs.FeedMessage, requestErrs []error)
 
-// NewFeed creates a new feed.
-//
-// This function gets static and realtime data from the source API and creates the
-// first version of the GTFS realtime feed before returning.
-// It then, in the background, periodically updates the realtime data following the provided
-// update period.
-//
-// After each update, including the first synchronous update, the provided callback is invoked.
-func NewFeed(ctx context.Context, clock clock.Clock, updatePeriod time.Duration, sourceClient SourceClient, callback UpdateCallback) (*Feed, error) {
-	f := Feed{}
+func NewTripUpdateFeed(ctx context.Context, clock clock.Clock, updatePeriod time.Duration, sourceClient SourceClient, staticData StaticData, callback UpdateCallback) (*Feed, error) {
 	fmt.Println("Starting up")
-	staticData, err := getStaticData(ctx, sourceClient)
-	if err != nil {
-		return nil, err
-	}
 	realtimeData := map[sourceapi.Station][]Train{}
 
-	updateFunc := func() []error {
+	updateFunc := func(f *Feed) []error {
 		fmt.Println("Updating GTFS Realtime feed.")
 		requestErrs := updateRealtimeData(ctx, realtimeData, sourceClient, staticData)
 		feedMessage := buildGtfsRealtimeFeedMessage(clock, staticData, realtimeData)
@@ -79,9 +75,61 @@ func NewFeed(ctx context.Context, clock clock.Clock, updatePeriod time.Duration,
 		return requestErrs
 	}
 
-	errs := updateFunc()
+	return NewFeed("trip updates", ctx, clock, updatePeriod, updateFunc, callback)
+}
+
+func NewPortAuthorityAlertFeed(
+	ctx context.Context,
+	clock clock.Clock,
+	updatePeriod time.Duration,
+	sourceClient PortAuthorityClient,
+	staticData StaticData,
+	callback UpdateCallback) (*Feed, error) {
+
+	updateFunc := func(f *Feed) []error {
+		fmt.Println("Updating GTFS alert feed.")
+		incidents, err := sourceClient.GetIncidents(ctx)
+		errors := []error{}
+		if err != nil {
+			errors = append(errors, err)
+		}
+
+		feedMessage := buildGtfsRealtimeAlertsFeedMessage(clock, staticData, incidents)
+
+		out, err := proto.Marshal(feedMessage)
+		if err != nil {
+			panic(fmt.Sprintf("failed go generate realtime protobuf file: %s", err))
+		}
+
+		f.set(out)
+		callback(feedMessage, errors)
+		fmt.Println("Finished updating alerts")
+
+		return errors
+	}
+
+	return NewFeed("port authority alerts", ctx, clock, updatePeriod, updateFunc, callback)
+}
+
+// NewFeed creates a new feed.
+//
+// This function gets static and realtime data from the source API and creates the
+// first version of the GTFS realtime feed before returning.
+// It then, in the background, periodically updates the realtime data following the provided
+// update period.
+//
+// After each update, including the first synchronous update, the provided callback is invoked.
+func NewFeed(
+	feedId string,
+	ctx context.Context,
+	clock clock.Clock,
+	updatePeriod time.Duration,
+	updateFunc func(f *Feed) []error, callback UpdateCallback) (*Feed, error) {
+	fmt.Printf("Starting up feed %s\n", feedId)
+	f := Feed{}
+	errs := updateFunc(&f)
 	if len(errs) > 0 {
-		return nil, fmt.Errorf("failed to initialize realtime data: %v", errs)
+		return nil, fmt.Errorf("failed to initialize feed: %v", errs)
 	}
 	// We ensure the ticker is constructed before the function is returned; otherwise,
 	// there is a race condition between initializing the ticker and incrementing the
@@ -94,7 +142,7 @@ func NewFeed(ctx context.Context, clock clock.Clock, updatePeriod time.Duration,
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				updateFunc()
+				updateFunc(&f)
 			}
 		}
 	}()
@@ -123,29 +171,88 @@ func (f *Feed) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // A container for the static data retrieved at the start.
-type staticData struct {
-	stations        []sourceapi.Station
-	stationToStopId map[sourceapi.Station]string
-	routeToRouteId  map[sourceapi.Route]string
+type StaticData struct {
+	Stations        []sourceapi.Station
+	StationToStopId map[sourceapi.Station]string
+	RouteToRouteId  map[sourceapi.Route]string
+
+	PathAgencyId                      string
+	PortAuthorityStationCodeToStation map[string]sourceapi.Station
+	PortAuthorityRouteCodeToRoute     map[string]sourceapi.Route
+}
+
+func (s *StaticData) GetStopIdFromPortAuthorityStationCode(stationCode string) (string, error) {
+	station, ok := s.PortAuthorityStationCodeToStation[stationCode]
+	if !ok {
+		return "", fmt.Errorf("station %s not found", station)
+	}
+
+	stopId, ok := s.StationToStopId[station]
+	if !ok {
+		return "", fmt.Errorf("stopId not found for station %s", station)
+	}
+
+	return stopId, nil
+}
+
+func (s *StaticData) GetRouteIdFromPortAuthorityRouteCode(routeCode string) (string, error) {
+	route, ok := s.PortAuthorityRouteCodeToRoute[routeCode]
+	if !ok {
+		return "", fmt.Errorf("route %s not found", route)
+	}
+
+	routeId, ok := s.RouteToRouteId[route]
+	if !ok {
+		return "", fmt.Errorf("routeId not found for route %s", route)
+	}
+
+	return routeId, nil
 }
 
 // Gets static data from the source API.
-func getStaticData(ctx context.Context, sourceClient SourceClient) (staticData, error) {
-	var s staticData
+func GetStaticData(ctx context.Context, sourceClient SourceClient) (StaticData, error) {
+	s := StaticData{
+		PortAuthorityStationCodeToStation: map[string]sourceapi.Station{
+			"09S": sourceapi.Station_NINTH_STREET,
+			"14S": sourceapi.Station_FOURTEENTH_STREET,
+			"23S": sourceapi.Station_TWENTY_THIRD_STREET,
+			"33S": sourceapi.Station_THIRTY_THIRD_STREET,
+			"CHR": sourceapi.Station_CHRISTOPHER_STREET,
+			"EXP": sourceapi.Station_EXCHANGE_PLACE,
+			"GRV": sourceapi.Station_GROVE_STREET,
+			"HAR": sourceapi.Station_HARRISON,
+			"HOB": sourceapi.Station_HOBOKEN,
+			"JSQ": sourceapi.Station_JOURNAL_SQUARE,
+			"NEW": sourceapi.Station_NEWPORT,
+			"NWK": sourceapi.Station_NEWARK,
+			"WTC": sourceapi.Station_WORLD_TRADE_CENTER,
+		},
+		PortAuthorityRouteCodeToRoute: map[string]sourceapi.Route{
+			"HOB-33S":         sourceapi.Route_HOB_33,
+			"HOB-WTC":         sourceapi.Route_HOB_WTC,
+			"NEW-WTC":         sourceapi.Route_NPT_HOB,
+			"NWK-WTC":         sourceapi.Route_NWK_WTC,
+			"JSQ-33S":         sourceapi.Route_JSQ_33,
+			"JSQ-33S via HOB": sourceapi.Route_JSQ_33_HOB,
+		},
+		// This is from GTFS and should hopefully not change.
+		PathAgencyId: "151",
+	}
+
 	var err error
-	s.routeToRouteId, err = sourceClient.GetRouteToRouteId(ctx)
+	s.RouteToRouteId, err = sourceClient.GetRouteToRouteId(ctx)
 	if err != nil {
-		return staticData{}, err
+		return StaticData{}, err
 	}
-	s.stationToStopId, err = sourceClient.GetStationToStopId(ctx)
+	s.StationToStopId, err = sourceClient.GetStationToStopId(ctx)
 	if err != nil {
-		return staticData{}, err
+		return StaticData{}, err
 	}
-	for station := range s.stationToStopId {
-		s.stations = append(s.stations, station)
+	for station := range s.StationToStopId {
+		s.Stations = append(s.Stations, station)
 	}
-	sort.Slice(s.stations, func(i, j int) bool {
-		return s.stations[i] < s.stations[j]
+	sort.Slice(s.Stations, func(i, j int) bool {
+		return s.Stations[i] < s.Stations[j]
 	})
 	return s, nil
 }
@@ -154,14 +261,14 @@ func getStaticData(ctx context.Context, sourceClient SourceClient) (staticData, 
 //
 // If data for one or more stations cannot be retrieved, the pre-existing realtime data is conservered
 // and corresponding number of errors are returned.
-func updateRealtimeData(ctx context.Context, data map[sourceapi.Station][]Train, sourceClient SourceClient, staticData staticData) []error {
+func updateRealtimeData(ctx context.Context, data map[sourceapi.Station][]Train, sourceClient SourceClient, staticData StaticData) []error {
 	type trainsAtStation struct {
 		Station sourceapi.Station
 		Trains  []Train
 		Err     error
 	}
-	allTrainsAtStations := make(chan trainsAtStation, len(staticData.stationToStopId))
-	for station := range staticData.stationToStopId {
+	allTrainsAtStations := make(chan trainsAtStation, len(staticData.StationToStopId))
+	for station := range staticData.StationToStopId {
 		station := station
 		go func() {
 			r := trainsAtStation{Station: station}
@@ -170,12 +277,12 @@ func updateRealtimeData(ctx context.Context, data map[sourceapi.Station][]Train,
 		}()
 	}
 	var errs []error
-	for range staticData.stationToStopId {
+	for range staticData.StationToStopId {
 		trainsAtStation := <-allTrainsAtStations
 		if trainsAtStation.Err != nil {
 			errs = append(errs, trainsAtStation.Err)
 			fmt.Println("There was an error when retrieving data for station",
-				staticData.stationToStopId[trainsAtStation.Station])
+				staticData.StationToStopId[trainsAtStation.Station])
 			continue
 		}
 		data[trainsAtStation.Station] = trainsAtStation.Trains
@@ -184,7 +291,7 @@ func updateRealtimeData(ctx context.Context, data map[sourceapi.Station][]Train,
 }
 
 // Build a GTFS Realtime message from a snapshot of the current data.
-func buildGtfsRealtimeFeedMessage(clock clock.Clock, staticData staticData, realtimeData map[sourceapi.Station][]Train) *gtfs.FeedMessage {
+func buildGtfsRealtimeFeedMessage(clock clock.Clock, staticData StaticData, realtimeData map[sourceapi.Station][]Train) *gtfs.FeedMessage {
 	directionToBoolean := func(direction sourceapi.Direction) *uint32 {
 		var result uint32
 		if direction == sourceapi.Direction_TO_NY {
@@ -207,10 +314,10 @@ func buildGtfsRealtimeFeedMessage(clock clock.Clock, staticData staticData, real
 		return nil
 	}
 	var entities []*gtfs.FeedEntity
-	for _, apiStationId := range staticData.stations {
+	for _, apiStationId := range staticData.Stations {
 		trains := realtimeData[apiStationId]
 		for _, train := range trains {
-			routeID, ok := staticData.routeToRouteId[train.Route]
+			routeID, ok := staticData.RouteToRouteId[train.Route]
 			if !ok {
 				continue
 			}
@@ -230,7 +337,7 @@ func buildGtfsRealtimeFeedMessage(clock clock.Clock, staticData staticData, real
 				},
 				StopTimeUpdate: []*gtfs.TripUpdate_StopTimeUpdate{
 					{
-						StopId: ptr(staticData.stationToStopId[apiStationId]),
+						StopId: ptr(staticData.StationToStopId[apiStationId]),
 						Arrival: &gtfs.TripUpdate_StopTimeEvent{
 							Time: timestamppbToInt64(train.ProjectedArrival),
 						},
@@ -257,6 +364,121 @@ func buildGtfsRealtimeFeedMessage(clock clock.Clock, staticData staticData, real
 		},
 		Entity: entities,
 	}
+}
+
+// Build a GTFS Realtime message from a snapshot of the current data.
+func buildGtfsRealtimeAlertsFeedMessage(clock clock.Clock, staticData StaticData, incidents []Incident) *gtfs.FeedMessage {
+	var entities []*gtfs.FeedEntity
+	for _, incident := range incidents {
+		incidentMessage := incident.IncidentMessage
+		if incidentMessage == nil {
+			continue
+		}
+
+		// Subject and description of the incident
+		subject := incidentMessage.Subject
+		preMessage := incidentMessage.PreMessage
+
+		formVariableItems := incidentMessage.FormVariableItems
+		var informedEntities []*gtfs.EntitySelector
+		var alertEffect *gtfs.Alert_Effect
+
+		for _, formVariableItem := range formVariableItems {
+			if len(formVariableItem.GetVal()) == 0 {
+				continue
+			}
+
+			if formVariableItem.VariableName == "Station" {
+				stopId, err := staticData.GetStopIdFromPortAuthorityStationCode(formVariableItem.GetVal()[0])
+				if err != nil {
+					continue
+				}
+
+				informedEntities = append(informedEntities, &gtfs.EntitySelector{
+					StopId: ptr(stopId),
+				})
+			}
+
+			if formVariableItem.VariableName == "Lines" {
+				for _, line := range formVariableItem.GetVal() {
+					routeId, err := staticData.GetRouteIdFromPortAuthorityRouteCode(line)
+					if err != nil {
+						continue
+					}
+
+					informedEntities = append(informedEntities, &gtfs.EntitySelector{
+						RouteId: ptr(routeId),
+					})
+				}
+			}
+
+			if formVariableItem.VariableName == "Status" {
+				normalizedStatus := removePunctuation(strings.ToLower(formVariableItem.GetVal()[0]))
+				switch normalizedStatus {
+				case "delayed":
+					alertEffect = ptr(gtfs.Alert_SIGNIFICANT_DELAYS)
+					break
+				}
+			}
+		}
+
+		// If no informed entities, then the alert is for the whole agency. This may not
+		// always make sense, but the GTFS spec requires at least one informed entity.
+		if len(informedEntities) == 0 {
+			informedEntities = append(informedEntities, &gtfs.EntitySelector{
+				AgencyId: &staticData.PathAgencyId,
+			})
+		}
+
+		alert := &gtfs.Alert{
+			HeaderText: &gtfs.TranslatedString{
+				Translation: []*gtfs.TranslatedString_Translation{
+					{
+						Text:     &subject,
+						Language: ptr("en"),
+					},
+				},
+			},
+			DescriptionText: &gtfs.TranslatedString{
+				Translation: []*gtfs.TranslatedString_Translation{
+					{
+						Text:     &preMessage,
+						Language: ptr("en"),
+					},
+				},
+			},
+			InformedEntity: informedEntities,
+			Effect:         alertEffect,
+		}
+
+		b, err := json.Marshal(alert)
+		if err != nil {
+			panic(err)
+		}
+
+		entities = append(entities, &gtfs.FeedEntity{
+			Id:    ptr(fmt.Sprintf("%x", md5.Sum(b))),
+			Alert: alert,
+		})
+	}
+
+	return &gtfs.FeedMessage{
+		Header: &gtfs.FeedHeader{
+			GtfsRealtimeVersion: ptr("0.2"),
+			Incrementality:      gtfs.FeedHeader_FULL_DATASET.Enum(),
+			Timestamp:           ptr(uint64(clock.Now().Unix())),
+		},
+		Entity: entities,
+	}
+}
+
+func removePunctuation(input string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsPunct(r) {
+			return -1
+		}
+		return r
+	}, input)
 }
 
 func ptr[T any](t T) *T {

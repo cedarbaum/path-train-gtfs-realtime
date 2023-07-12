@@ -22,9 +22,12 @@ import (
 var indexHTMLPage string
 
 var port = flag.Int("port", 8080, "the port to bind the HTTP server to")
-var updatePeriod = flag.Duration("update_period", 5*time.Second, "how often to update the feed")
+var tripUpdatePeriod = flag.Duration("trip_update_period", 5*time.Second, "how often to update the feed")
+var alertUpdatePeriod = flag.Duration("alert_update_period", 30*time.Second, "how often to update the feed")
 var timeoutPeriod = flag.Duration("timeout_period", 5*time.Second, "maximum duration to wait for a response from the source API")
+var alertTimeoutPeriod = flag.Duration("alert_timeout_period", 30*time.Second, "maximum duration to wait for a response from the source API")
 var useHTTPSourceAPI = flag.Bool("use_http_source_api", false, "use the HTTP source API instead of the default gRPC API")
+var publishPortAuthorityAlerts = flag.Bool("publish_port_authority_alerts", false, "publish alerts from the Port Authorities Everbridge feed")
 
 var numUpdatesCounter = promauto.NewCounter(
 	prometheus.CounterOpts{
@@ -51,10 +54,17 @@ var numTripStopTimesGauge = promauto.NewGaugeVec(
 	},
 	[]string{"stop_id", "direction"},
 )
-var numRequestsCounter = promauto.NewCounterVec(
+var tripUpdateFeedRequestCounter = promauto.NewCounterVec(
 	prometheus.CounterOpts{
-		Name: "path_train_gtfsrt_num_requests",
-		Help: "Number of times the GTFS-RT feed has been requested",
+		Name: "path_train_gtfsrt_trip_feed_num_requests",
+		Help: "Number of times the GTFS-RT trip update feed has been requested",
+	},
+	[]string{"code"},
+)
+var portAuthorityAlertFeedRequestCounter = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "path_train_gtfsrt_port_authority_alert_feed_num_requests",
+		Help: "Number of times the GTFS-RT Port Authority alert feed has been requested",
 	},
 	[]string{"code"},
 )
@@ -82,14 +92,29 @@ func run(ctx context.Context) error {
 		sourceClient = grpcClient
 	}
 
-	f, err := pathgtfsrt.NewFeed(ctx, clock.New(), *updatePeriod, sourceClient, recordUpdate)
+	staticData, err := pathgtfsrt.GetStaticData(ctx, sourceClient)
+	if err != nil {
+		return err
+	}
+
+	tripUpdateFeed, err := pathgtfsrt.NewTripUpdateFeed(ctx, clock.New(), *tripUpdatePeriod, sourceClient, staticData, recordTripUpdate)
 	if err != nil {
 		return fmt.Errorf("failed to initialize feed: %s", err)
 	}
 
 	http.HandleFunc("/", rootHandler)
-	http.Handle("/gtfsrt", promhttp.InstrumentHandlerCounter(numRequestsCounter, f))
+	http.Handle("/gtfsrt", promhttp.InstrumentHandlerCounter(tripUpdateFeedRequestCounter, tripUpdateFeed))
 	http.Handle("/metrics", promhttp.Handler())
+
+	if *publishPortAuthorityAlerts {
+		fmt.Println("Publishing Port Authority alerts")
+		portAuthorityClient := pathgtfsrt.NewPortAuthorityClient(*alertTimeoutPeriod)
+		portAuthorityAlertFeed, err := pathgtfsrt.NewPortAuthorityAlertFeed(ctx, clock.New(), *alertUpdatePeriod, portAuthorityClient, staticData, recordAlertUpdate)
+		if err != nil {
+			return err
+		}
+		http.Handle("/port_authority_alerts", promhttp.InstrumentHandlerCounter(tripUpdateFeedRequestCounter, portAuthorityAlertFeed))
+	}
 
 	return http.ListenAndServe(fmt.Sprintf(":%d", *port), nil)
 }
@@ -107,7 +132,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func recordUpdate(msg *gtfs.FeedMessage, errs []error) {
+func recordTripUpdate(msg *gtfs.FeedMessage, errs []error) {
 	numTripStopTimesGauge.Reset()
 	for _, entity := range msg.GetEntity() {
 		directionID := "NY"
@@ -122,4 +147,7 @@ func recordUpdate(msg *gtfs.FeedMessage, errs []error) {
 	numUpdatesCounter.Inc()
 	numRequestErrs.Add(float64(len(errs)))
 	lastUpdateGauge.SetToCurrentTime()
+}
+
+func recordAlertUpdate(msg *gtfs.FeedMessage, errs []error) {
 }

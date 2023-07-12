@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+import "google/api/annotations.proto";
+
+package portauthority.v1;
+
+service Incidents {
+    rpc GetIncidents(GetIncidentsRequest) returns (GetIncidentsResponse) {
+        option (google.api.http) = {
+            get: "bin/portauthority/everbridge/incidents"
+        };
+    }
+}
+
+message GetIncidentsRequest {
+    string status = 1;
+    string department = 2;
+}
+
+message GetIncidentsResponse {
+
+    message Formvariableitems {
+        repeated string val = 1;
+        string variableName = 2;
+        bool isRequired = 3;
+        uint32 seq = 4;
+        uint64 variableId = 5;
+        string prefixName = 6;
+    }
+
+    message Incidentmessage {
+        string subject = 1;
+        string preMessage = 2;
+        repeated Formvariableitems formVariableItems = 3;
+        string sysVarTodayDateFormat = 4;
+        string sysVarCurrentTimeFormat = 5;
+    }
+
+    message Data {
+        Incidentmessage incidentMessage = 1;
+        string CreatedDate = 2;
+        string ModifiedDate = 3;
+    }
+
+    string status = 1;
+    repeated Data data = 2;
+}
